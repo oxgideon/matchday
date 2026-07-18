@@ -17,14 +17,12 @@ const API_ORIGIN =
   NETWORK === "mainnet" ? "https://txline.txodds.com" : "https://txline-dev.txodds.com";
 
 let jwt = null;
-let apiToken = null;
+const apiToken = process.env.TXLINE_API_TOKEN;
 
-async function loadApiToken() {
-  const doc = await db.collection("config").doc("txline").get();
-  if (!doc.exists) {
-    throw new Error("Run subscribeAndActivate.js first, save { apiToken } to Firestore config/txline");
+function checkApiToken() {
+  if (!apiToken) {
+    throw new Error("TXLINE_API_TOKEN env var is missing — run subscribeAndActivate.js on mainnet and set it in Railway");
   }
-  apiToken = doc.data().apiToken;
 }
 
 async function refreshJwt() {
@@ -193,7 +191,7 @@ async function marketSummary(fixtureId) {
 // ---------- Boot ----------
 const PORT = process.env.PORT || 3000;
 (async () => {
-  await loadApiToken();
+  checkApiToken();
   await refreshJwt();
   app.listen(PORT, () => console.log(`MATCHDAY backend live on ${PORT}`));
   setInterval(pollLiveFixtures, 20_000);
@@ -201,13 +199,15 @@ const PORT = process.env.PORT || 3000;
 })();
 
 /*
-Railway env vars:
+Railway env vars (already set):
   FIREBASE_SERVICE_ACCOUNT  — full JSON string of your Firebase service account
   TELEGRAM_BOT_TOKEN        — @Matchdayrobot's BotFather token
-  TXLINE_NETWORK            — "devnet" while testing, "mainnet" for the real submission
+  TXLINE_API_TOKEN          — from subscribeAndActivate.js — MUST be re-generated on mainnet
+  TXLINE_NETWORK            — set to "mainnet" for the real submission
+  WALLET_SECRET_KEY         — used by generateWallet.js / subscribeAndActivate.js only, not by this file
 
-Firestore setup:
-  config/txline = { apiToken: "<from subscribeAndActivate.js>" }
+Note: TXLINE_GUEST_JWT is not used here — JWTs expire fast, so this server
+fetches its own fresh one at boot and every 10 minutes via refreshJwt().
 
 After deploy, set the Telegram webhook once:
   https://api.telegram.org/bot<TOKEN>/setWebhook?url=<your-railway-url>/telegram/webhook
