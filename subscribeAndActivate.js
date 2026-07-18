@@ -1,0 +1,20 @@
+{
+  "name": "goal-line",
+  "version": "1.0.0",
+  "description": "TxLINE World Cup hackathon project",
+  "main": "subscribeAndActivate.js",
+  "scripts": {
+    "start": "node server.js",
+    "generate-wallet": "node generateWallet.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.3",
+    "@solana/spl-token": "^0.4.9",
+    "axios": "^1.7.7",
+    "tweetnacl": "^1.0.3",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
