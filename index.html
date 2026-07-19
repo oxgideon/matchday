@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MATCHDAY — World Cup Predictions</title>
+<style>
+  :root {
+    --bg: #0b1220; --card: #131b2e; --line: #232d47;
+    --green: #22c55e; --red: #ef4444; --gold: #facc15; --muted: #8b98b8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: #eef1f8; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 20px 16px; text-align: center; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 24px; letter-spacing: 1px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  #walletBar { display: flex; justify-content: center; gap: 10px; align-items: center; padding: 12px; }
+  button { background: var(--green); color: #04140a; border: none; padding: 10px 18px; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 14px; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #balance { font-weight: 700; color: var(--gold); }
+  main { max-width: 640px; margin: 0 auto; padding: 8px 16px 60px; }
+  .match { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .match .teams { display: flex; justify-content: space-between; font-weight: 700; font-size: 15px; }
+  .match .meta { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex; justify-content: space-between; }
+  .status-live { color: var(--red); font-weight: 700; }
+  .status-completed { color: var(--muted); }
+  .odds-row { display: flex; gap: 8px; margin-top: 10px; }
+  .odds-btn { flex: 1; background: #1b2440; border: 1px solid var(--line); border-radius: 8px; padding: 8px 4px; text-align: center; cursor: pointer; }
+  .odds-btn:hover { border-color: var(--green); }
+  .odds-btn .label { font-size: 11px; color: var(--muted); }
+  .odds-btn .price { font-size: 16px; font-weight: 700; color: var(--gold); }
+  #empty { text-align: center; color: var(--muted); padding: 40px 0; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; }
+  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; width: 300px; }
+  .modal h3 { margin-top: 0; }
+  .modal input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: #0b1220; color: white; font-size: 16px; margin: 10px 0; }
+  .modal .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .modal .actions button.cancel { background: #2a3455; color: #eef1f8; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚽ MATCHDAY</h1>
+  <p>Live World Cup odds, powered by TxLINE · devnet</p>
+</header>
+
+<div id="walletBar">
+  <button id="connectBtn">Connect Phantom (devnet)</button>
+  <span id="balance" style="display:none;"></span>
+</div>
+
+<main>
+  <div id="matches"></div>
+  <div id="empty" style="display:none;">No matches synced yet — the backend polls TxLINE every ~65s.</div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bs58/5.0.0/index.min.js"></script>
+<script>
+let sessionToken = null;
+let pubkey = null;
+
+const connectBtn = document.getElementById("connectBtn");
+const balanceEl = document.getElementById("balance");
+
+connectBtn.addEventListener("click", async () => {
+  if (!window.solana || !window.solana.isPhantom) {
+    alert("Phantom wallet not found. Install it from phantom.app, switch it to Devnet in Settings, then reload.");
+    return;
+  }
+  try {
+    const resp = await window.solana.connect();
+    pubkey = resp.publicKey.toString();
+
+    const message = new TextEncoder().encode(`MATCHDAY login: ${pubkey}`);
+    const signed = await window.solana.signMessage(message, "utf8");
+    const signature = bs58.encode(signed.signature);
+
+    const loginRes = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey, signature }),
+    });
+    const loginData = await loginRes.json();
+    if (!loginRes.ok) throw new Error(loginData.error);
+
+    sessionToken = loginData.sessionToken;
+    connectBtn.textContent = pubkey.slice(0, 4) + "..." + pubkey.slice(-4);
+    connectBtn.disabled = true;
+    balanceEl.style.display = "inline";
+    balanceEl.textContent = `${loginData.points} pts`;
+  } catch (err) {
+    alert("Wallet login failed: " + err.message);
+  }
+});
+
+async function loadMatches() {
+  const res = await fetch("/api/matches");
+  const matches = await res.json();
+  const container = document.getElementById("matches");
+  const empty = document.getElementById("empty");
+
+  if (!matches.length) {
+    empty.style.display = "block";
+    container.innerHTML = "";
+    return;
+  }
+  empty.style.display = "none";
+
+  container.innerHTML = matches.map(renderMatch).join("");
+
+  container.querySelectorAll(".odds-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!sessionToken) return alert("Connect your wallet first.");
+      const { fixtureId, pick, odds } = btn.dataset;
+      openBetModal(fixtureId, pick, parseFloat(odds));
+    });
+  });
+}
+
+function renderMatch(m) {
+  const statusLabel = m.status === "live" ? "🔴 LIVE" : m.status === "completed" ? "FT" : new Date(m.kickoffAt).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+  const statusClass = m.status === "live" ? "status-live" : m.status === "completed" ? "status-completed" : "";
+  const canBet = m.status === "scheduled";
+
+  const oddsRow = canBet
+    ? `<div class="odds-row">
+        ${oddsBtn(m.id, "home", m.oddsHome, m.home)}
+        ${oddsBtn(m.id, "draw", m.oddsDraw, "Draw")}
+        ${oddsBtn(m.id, "away", m.oddsAway, m.away)}
+      </div>`
+    : `<div class="meta" style="margin-top:8px;">Score: <strong>${m.score || "-"}</strong></div>`;
+
+  return `<div class="match">
+    <div class="teams"><span>${m.home}</span><span>vs</span><span>${m.away}</span></div>
+    <div class="meta"><span class="${statusClass}">${statusLabel}</span><span>${m.score || ""}</span></div>
+    ${oddsRow}
+  </div>`;
+}
+
+function oddsBtn(fixtureDocId, pick, odds, label) {
+  const fixtureId = fixtureDocId.replace("wc_", "");
+  if (!odds) return `<div class="odds-btn" style="opacity:0.4;"><div class="label">${label}</div><div class="price">—</div></div>`;
+  return `<div class="odds-btn" data-fixture-id="${fixtureId}" data-pick="${pick}" data-odds="${odds}">
+    <div class="label">${label}</div><div class="price">${odds.toFixed(2)}</div>
+  </div>`;
+}
+
+function openBetModal(fixtureId, pick, odds) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal">
+      <h3>Place bet — ${pick.toUpperCase()} @ ${odds.toFixed(2)}</h3>
+      <input type="number" id="betAmount" placeholder="Points to wager" min="1" />
+      <div class="actions">
+        <button class="cancel" id="cancelBet">Cancel</button>
+        <button id="confirmBet">Place bet</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+
+  document.getElementById("cancelBet").onclick = () => backdrop.remove();
+  document.getElementById("confirmBet").onclick = async () => {
+    const amount = parseInt(document.getElementById("betAmount").value, 10);
+    if (!amount || amount <= 0) return alert("Enter a valid amount.");
+    try {
+      const res = await fetch("/api/bets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ fixtureId: parseInt(fixtureId, 10), pick, amount }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert(`Bet placed! Potential payout: ${data.potentialPayout} pts`);
+      backdrop.remove();
+      refreshBalance();
+      loadMatches();
+    } catch (err) {
+      alert("Bet failed: " + err.message);
+    }
+  };
+}
+
+async function refreshBalance() {
+  if (!sessionToken) return;
+  const res = await fetch("/api/me", { headers: { Authorization: `Bearer ${sessionToken}` } });
+  const data = await res.json();
+  balanceEl.textContent = `${data.points} pts`;
+}
+
+loadMatches();
+setInterval(loadMatches, 15000);
+</script>
+</body>
+</html>
+
