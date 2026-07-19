@@ -1,276 +1,837 @@
-// server.js — MATCHDAY
+// server.js — GoalLine market sync worker
+//
+// Pulls World Cup fixtures/odds/scores from TxLINE and writes them into the
+// Firestore "markets" collection in the exact shape index.html expects:
+//   home, away, homeFlag, awayFlag, status, score, time,
+//   oddsHome, oddsDraw, oddsAway, createdAt
+//
+// Requires (npm install):
+//   npm install express axios firebase-admin
 //
 // Required Railway env vars:
-//   TXLINE_WALLET_SECRET_KEY      - from generateWallet.js
-//   FIREBASE_SERVICE_ACCOUNT_KEY  - full service account JSON, one line
-//   PORT                          - Railway sets this automatically
+//   TXLINE_GUEST_JWT        - from subscribeAndActivate.js output
+//   TXLINE_API_TOKEN        - from subscribeAndActivate.js output
+//   FIREBASE_SERVICE_ACCOUNT_KEY - full service account JSON, as a single-line string
+//   PORT                    - Railway sets this automatically
 //
-// npm install first (see package.json).
+// NOTE: if your other server.js files use a different env var name for the
+// Firebase service account, tell me and I'll give you the one-line swap.
 
 const express = require("express");
+const axios = require("axios");
 const admin = require("firebase-admin");
-const nacl = require("tweetnacl");
-const bs58 = require("bs58");
-const crypto = require("crypto");
-const txline = require("./txline");
+const TelegramBot = require("node-telegram-bot-api");
 
-// ─── FIREBASE ────────────────────────────────────────────────────────────
+// ─── CONFIG ──────────────────────────────────────────────────────────────
+const NETWORK = "devnet"; // switch to "mainnet" later if you move off devnet
+const CONFIG = {
+  mainnet: { apiOrigin: "https://txline.txodds.com" },
+  devnet: { apiOrigin: "https://txline-dev.txodds.com" },
+};
+const apiOrigin = CONFIG[NETWORK].apiOrigin;
+const apiBaseUrl = `${apiOrigin}/api`;
+
+const SYNC_INTERVAL_MS = 65_000; // free tier delay is ~60s, no point polling faster
+const COMMENTARY_INTERVAL_MS = 25_000; // how often we generate a new batch of commentary lines per live match
+
+// ─── FIREBASE ADMIN INIT ────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 const db = admin.firestore();
 
-const STARTING_POINTS = 1000;
-const SYNC_INTERVAL_MS = 65_000;
+// ─── TELEGRAM BOT (account linking + live alerts) ───────────────────────
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+let bot = null;
+if (TELEGRAM_BOT_TOKEN) {
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// Hardcoded from TxLINE's published World Cup schedule. Swap this out for a
-// dynamic competitionId filter on /api/fixtures/snapshot if TxLINE exposes
-// one for World Cup by the time you're building — check the fixtures
-// response shape first (console.log it once) to confirm.
-const WORLD_CUP_FIXTURE_IDS = [
-  17588325, 17588326, 18167317, 18172489, 18175983, 18172260, 18175397,
-  18175981, 18179759, 18179764, 18179550, 18172379, 18179551, 18179763,
-  18179552, 18176123, 18175918, 18179549, 18185036, 18188721, 18187298,
-  18192996, 18198205, 18193785, 18202701, 18202783, 18209181, 18218149,
-  18213979, 18222446, 18237038, 18241006, 18257865, 18257739,
-];
+  // Registers the native "/" commands menu button in Telegram's chat UI
+  bot.setMyCommands([
+    { command: "start", description: "Get started / link your GoalLine account" },
+    { command: "link", description: "Link your account" },
+    { command: "unlink", description: "Stop receiving alerts" },
+    { command: "help", description: "Show all commands" },
+  ]);
 
-// ─── IN-MEMORY SESSIONS (fine for a hackathon demo) ─────────────────────
-const sessions = new Map(); // sessionToken -> pubkey
+  const awaitingOtp = new Set(); // chatIds we just asked for an OTP, expecting plain text next
 
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  const pubkey = token && sessions.get(token);
-  if (!pubkey) return res.status(401).json({ error: "Not authenticated" });
-  req.pubkey = pubkey;
-  next();
+  const HELP_TEXT = "📋 *GoalLine Bot Commands*\n\n"
+    + "/start — Welcome message & instructions\n"
+    + "/link — Link your GoalLine account (I'll ask for your code)\n"
+    + "/unlink — Stop receiving alerts on this chat\n"
+    + "/help — Show this list\n\n"
+    + "Once linked, I message you here automatically for goals ⚽, cards 🟨🟥, big odds shifts 📊, and full-time results 🏁 — no further commands needed.";
+
+  const START_TEXT = "👋 *Welcome to GoalLine!*\n\n"
+    + "I send live World Cup alerts straight to this chat — goals, cards, odds shifts, and full-time scores.\n\n"
+    + "*To link your account:*\n"
+    + "1. Open the GoalLine app → Profile → Connect Telegram\n"
+    + "2. You'll get a 6-digit code\n"
+    + "3. Send /link here, then just type the code when I ask for it\n\n"
+    + "Tap the button below any time to see all commands.";
+
+  const commandsButton = {
+    reply_markup: { inline_keyboard: [[{ text: "📋 Show Commands", callback_data: "show_commands" }]] },
+  };
+
+  async function findLinkedUser(chatId) {
+    const snap = await db.collection("users").where("telegramChatId", "==", String(chatId)).limit(1).get();
+    return snap.empty ? null : snap.docs[0];
+  }
+
+  bot.onText(/\/start(?:\s+(\w+))?/, async (msg, match) => {
+    if (match[1]) {
+      await linkTelegramCode(match[1], msg.chat.id);
+      return;
+    }
+    const linkedDoc = await findLinkedUser(msg.chat.id);
+    if (linkedDoc) {
+      bot.sendMessage(msg.chat.id, `✅ You're already linked as *${linkedDoc.data().name || "a GoalLine user"}*. You'll keep getting live match alerts here — no action needed. Use /unlink if you ever want to stop.`, { parse_mode: "Markdown" });
+      return;
+    }
+    bot.sendMessage(msg.chat.id, START_TEXT, { parse_mode: "Markdown", ...commandsButton });
+  });
+
+  bot.onText(/\/help/, (msg) => {
+    bot.sendMessage(msg.chat.id, HELP_TEXT, { parse_mode: "Markdown" });
+  });
+
+  bot.onText(/^\/link(?:\s+(\w+))?$/, async (msg, match) => {
+    const linkedDoc = await findLinkedUser(msg.chat.id);
+    if (linkedDoc) {
+      bot.sendMessage(msg.chat.id, `You're already linked as *${linkedDoc.data().name || "a GoalLine user"}*. Use /unlink first if you want to link a different account.`, { parse_mode: "Markdown" });
+      return;
+    }
+    if (match[1]) {
+      awaitingOtp.delete(msg.chat.id);
+      await linkTelegramCode(match[1], msg.chat.id);
+      return;
+    }
+    awaitingOtp.add(msg.chat.id);
+    bot.sendMessage(msg.chat.id, "🔑 Please send me your 6-digit code from Profile → Connect Telegram in the app. Just type it and hit send.");
+  });
+
+  bot.onText(/\/unlink/, async (msg) => {
+    const linkedDoc = await findLinkedUser(msg.chat.id);
+    if (!linkedDoc) {
+      bot.sendMessage(msg.chat.id, "You're not currently linked to a GoalLine account.");
+      return;
+    }
+    bot.sendMessage(msg.chat.id, "⚠️ Are you sure? You'll stop receiving goal, card, odds-shift, and full-time alerts.", {
+      reply_markup: { inline_keyboard: [[
+        { text: "✅ Yes, unlink", callback_data: "unlink_confirm" },
+        { text: "❌ Cancel", callback_data: "unlink_cancel" },
+      ]] },
+    });
+  });
+
+  // Free-text fallback: if we just asked this chat for an OTP, treat their next message as the code
+  bot.on("message", async (msg) => {
+    if (!msg.text || msg.text.startsWith("/")) return;
+    if (!awaitingOtp.has(msg.chat.id)) return;
+    awaitingOtp.delete(msg.chat.id);
+    await linkTelegramCode(msg.text.trim(), msg.chat.id);
+  });
+
+  bot.on("callback_query", async (query) => {
+    const chatId = query.message.chat.id;
+    if (query.data === "show_commands") {
+      await bot.answerCallbackQuery(query.id);
+      bot.sendMessage(chatId, HELP_TEXT, { parse_mode: "Markdown" });
+      return;
+    }
+    if (query.data === "unlink_confirm") {
+      await bot.answerCallbackQuery(query.id);
+      const linkedDoc = await findLinkedUser(chatId);
+      if (linkedDoc) {
+        await linkedDoc.ref.update({ telegramChatId: admin.firestore.FieldValue.delete() });
+        bot.sendMessage(chatId, "🔕 You've been unlinked. You won't receive any more alerts here. Send /link any time to reconnect.");
+      } else {
+        bot.sendMessage(chatId, "You're not currently linked.");
+      }
+      return;
+    }
+    if (query.data === "unlink_cancel") {
+      await bot.answerCallbackQuery(query.id);
+      bot.sendMessage(chatId, "👍 Staying linked — you'll keep getting alerts.");
+      return;
+    }
+  });
+
+  bot.on("polling_error", (err) => {
+    // Expected during redeploys — the old container's connection briefly
+    // overlaps with the new one. Non-fatal; polling recovers automatically.
+    if (err.code !== "ETELEGRAM" || !String(err.message).includes("409")) {
+      console.warn("Telegram polling error:", err.message);
+    }
+  });
+
+  console.log("Telegram bot polling started.");
+} else {
+  console.warn("TELEGRAM_BOT_TOKEN not set — Telegram notifications disabled.");
 }
 
-// ─── APP ─────────────────────────────────────────────────────────────────
-const app = express();
-app.use(express.json());
-app.use(express.static(__dirname + "/public"));
-
-// Wallet login: client signs a fixed message with Phantom, we verify and
-// hand back a session token plus current points balance.
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { pubkey, signature } = req.body;
-    if (!pubkey || !signature) {
-      return res.status(400).json({ error: "pubkey and signature required" });
-    }
-    const message = new TextEncoder().encode(`MATCHDAY login: ${pubkey}`);
-    const sigBytes = bs58.decode(signature);
-    const pubkeyBytes = bs58.decode(pubkey);
-    const valid = nacl.sign.detached.verify(message, sigBytes, pubkeyBytes);
-    if (!valid) return res.status(401).json({ error: "Invalid signature" });
-
-    const userRef = db.collection("users").doc(pubkey);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) {
-      await userRef.set({
-        pubkey,
-        points: STARTING_POINTS,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    }
-    const sessionToken = crypto.randomBytes(24).toString("hex");
-    sessions.set(sessionToken, pubkey);
-
-    const finalUser = (await userRef.get()).data();
-    res.json({ sessionToken, points: finalUser.points });
-  } catch (err) {
-    console.error("Login failed:", err.message);
-    res.status(500).json({ error: "Login failed" });
+async function linkTelegramCode(code, chatId) {
+  const usersSnap = await db.collection("users").where("telegramOtp", "==", code).limit(1).get();
+  if (usersSnap.empty) {
+    bot.sendMessage(chatId, "❌ Invalid or expired code. Generate a new one from Profile → Connect Telegram.");
+    return;
   }
-});
+  const userDoc = usersSnap.docs[0];
+  const user = userDoc.data();
+  if (user.telegramOtpExpires && user.telegramOtpExpires.toMillis() < Date.now()) {
+    bot.sendMessage(chatId, "❌ That code expired. Generate a new one from Profile → Connect Telegram.");
+    return;
+  }
+  await userDoc.ref.update({
+    telegramChatId: String(chatId),
+    telegramOtp: admin.firestore.FieldValue.delete(),
+    telegramOtpExpires: admin.firestore.FieldValue.delete(),
+  });
+  bot.sendMessage(chatId, `✅ Linked! You're set as ${user.name || "a GoalLine user"}. I'll ping you here for goals, red cards, and big odds shifts.`);
+}
 
-app.get("/api/me", requireAuth, async (req, res) => {
-  const doc = await db.collection("users").doc(req.pubkey).get();
-  res.json(doc.data());
-});
+const TTS_ENABLED = process.env.TELEGRAM_TTS_ENABLED === "true";
 
-app.get("/api/matches", async (req, res) => {
-  const snap = await db.collection("markets").orderBy("kickoffAt").get();
-  res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-});
+async function synthesizeSpeech(text) {
+  // Free, no-key TTS endpoint — good enough for a hackathon demo.
+  const url = `https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(text)}`;
+  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 8000 });
+  return Buffer.from(res.data);
+}
 
-app.get("/api/my-bets", requireAuth, async (req, res) => {
-  const snap = await db
-    .collection("bets")
-    .where("pubkey", "==", req.pubkey)
-    .orderBy("createdAt", "desc")
-    .get();
-  res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-});
+async function notifyLinkedUsers(text, speakText, imageUrl) {
+  if (!bot) return;
+  const usersSnap = await db.collection("users").where("telegramChatId", "!=", null).get();
 
-app.post("/api/bets", requireAuth, async (req, res) => {
-  try {
-    const { fixtureId, pick, amount } = req.body;
-    if (!fixtureId || !["home", "draw", "away"].includes(pick) || !(amount > 0)) {
-      return res.status(400).json({ error: "fixtureId, valid pick, and positive amount required" });
+  let audioBuffer = null;
+  if (TTS_ENABLED && speakText) {
+    try {
+      audioBuffer = await synthesizeSpeech(speakText);
+    } catch (err) {
+      console.warn("TTS synthesis failed, sending text only:", err.message);
     }
+  }
 
-    const marketRef = db.collection("markets").doc(`wc_${fixtureId}`);
-    const userRef = db.collection("users").doc(req.pubkey);
+  await Promise.all(usersSnap.docs.map(async (doc) => {
+    const chatId = doc.data().telegramChatId;
+    try {
+      if (imageUrl) {
+        await bot.sendPhoto(chatId, imageUrl, { caption: text, parse_mode: "Markdown" });
+      } else {
+        await bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
+      }
+      if (audioBuffer) {
+        await bot.sendAudio(chatId, audioBuffer, {}, { filename: "alert.mp3", contentType: "audio/mpeg" });
+      }
+    } catch (err) {
+      console.warn(`Telegram send failed for ${doc.id}:`, err.message);
+    }
+  }));
+}
 
-    const result = await db.runTransaction(async (tx) => {
-      const marketDoc = await tx.get(marketRef);
-      const userDoc = await tx.get(userRef);
-      if (!marketDoc.exists) throw new Error("Match not found");
-      const market = marketDoc.data();
-      if (market.status !== "scheduled") throw new Error("Betting closed for this match");
-      const user = userDoc.data();
-      if (user.points < amount) throw new Error("Not enough points");
+// ─── PREVIOUS STATE CACHE (for detecting goals / odds shifts) ───────────
+const prevFixtureState = new Map();
+const ODDS_SHIFT_PROB_THRESHOLD = 8; // percentage points of implied probability — robust across all odds scales
+const GOAL_IMAGE_URL = "https://i.postimg.cc/y6Zkd4rW/file-000000006cd081f4910f83c867f91fa9.png";
 
-      const oddsKey = pick === "home" ? "oddsHome" : pick === "away" ? "oddsAway" : "oddsDraw";
-      const odds = market[oddsKey];
-      if (!odds) throw new Error("Odds not available yet for this pick");
+function impliedProb(decimalOdds) {
+  return decimalOdds ? Math.round((1 / decimalOdds) * 100) : null;
+}
 
-      tx.update(userRef, { points: admin.firestore.FieldValue.increment(-amount) });
-      const betRef = db.collection("bets").doc();
-      tx.set(betRef, {
-        pubkey: req.pubkey,
-        fixtureId,
-        fixtureDocId: marketRef.id,
-        pick,
-        amount,
-        oddsAtBet: odds,
-        potentialPayout: Math.round(amount * odds),
-        status: "pending",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      return { betId: betRef.id, potentialPayout: Math.round(amount * odds) };
+async function logMatchEvent(fixtureId, event) {
+  try {
+    await db.collection("markets").doc(`wc_${fixtureId}`).update({
+      events: admin.firestore.FieldValue.arrayUnion({ ...event, timestamp: new Date().toISOString() }),
     });
-
-    res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    console.warn(`Failed to log timeline event for fixture ${fixtureId}:`, err.message);
   }
-});
+}
 
-// ─── TXLINE SYNC ─────────────────────────────────────────────────────────
-function mapPhaseToStatus(phaseId) {
-  if (phaseId === 1) return "scheduled";
-  if ([5, 10, 13].includes(phaseId)) return "completed";
-  if ([15, 16, 17, 18, 19].includes(phaseId)) return "cancelled";
+async function maybeNotify(fixtureId, homeTeam, awayTeam, marketDoc, odds, cards, status, scoreData) {
+  const prev = prevFixtureState.get(fixtureId);
+  const curr = {
+    score: marketDoc.score,
+    oddsHome: odds?.oddsHome,
+    oddsAway: odds?.oddsAway,
+    redHome: cards.redHome, redAway: cards.redAway,
+    yellowHome: cards.yellowHome, yellowAway: cards.yellowAway,
+    cornersHome: cards.cornersHome, cornersAway: cards.cornersAway,
+  };
+
+  if (prev) {
+    if (prev.score !== curr.score && curr.score !== "0-0") {
+      const [hGoals, aGoals] = curr.score.split("-").map(Number);
+      const [prevH, prevA] = prev.score.split("-").map(Number);
+      const scoringTeam = hGoals > prevH ? homeTeam : awayTeam;
+      const concedingTeam = scoringTeam === homeTeam ? awayTeam : homeTeam;
+      const margin = Math.abs(hGoals - aGoals);
+
+      const goalEvent = getLatestEventByAction(scoreData, "goal");
+      const lookup = buildPlayerLookup(scoreData);
+      const scorer = goalEvent?.Data?.PlayerId ? lookup[goalEvent.Data.PlayerId] : null;
+      const typePhrase = goalTypePhrase(goalEvent?.Data?.GoalType);
+      const scorerPhrase = scorer ? `${scorer}${typePhrase ? " " + typePhrase : ""}` : null;
+
+      const commentary = margin >= 2
+        ? pick([
+            `${scorerPhrase ? scorerPhrase + ", and " : ""}${scoringTeam} are pulling this one apart! ${curr.score} — it's starting to look like a formality for ${concedingTeam}.`,
+            `${scorerPhrase ? scorerPhrase + " does it again — " : ""}${scoringTeam} in total control. ${curr.score}, and ${concedingTeam} look shellshocked.`,
+          ])
+        : margin === 1
+        ? pick([
+            `${scorerPhrase ? scorerPhrase + " strikes! " : ""}${scoringTeam} edge in front — ${curr.score}. Game on.`,
+            `${scorerPhrase ? scorerPhrase + " finds the net! " : ""}${curr.score}, and ${concedingTeam} need a response, fast.`,
+          ])
+        : pick([
+            `${scorerPhrase ? scorerPhrase + " levels it up! " : ""}${curr.score} — we're all square again, wide open from here.`,
+          ]);
+
+      const text = `⚽ *GOAL!*\n${homeTeam} ${curr.score} ${awayTeam}\n${commentary}`;
+      await notifyLinkedUsers(text, `Goal! ${homeTeam} ${curr.score.replace("-", " ")} ${awayTeam}.`, GOAL_IMAGE_URL);
+      await logMatchEvent(fixtureId, { type: "goal", label: `Goal — ${scoringTeam}${scorer ? ` (${scorer})` : ""}` });
+    }
+    if (curr.redHome > prev.redHome) {
+      const commentary = pick([
+        `${homeTeam} are down to ten men — ${awayTeam} will sense the opening immediately.`,
+        `Straight red for ${homeTeam}! A mountain to climb from here, and the market already knows it.`,
+      ]);
+      const text = `🟥 *RED CARD* — ${homeTeam}\n${homeTeam} ${curr.score} ${awayTeam}\n${commentary}`;
+      await notifyLinkedUsers(text, `Red card for ${homeTeam}. They're down to ten men.`);
+      await logMatchEvent(fixtureId, { type: "red", label: `Red card — ${homeTeam}` });
+    }
+    if (curr.redAway > prev.redAway) {
+      const commentary = pick([
+        `${awayTeam} are down to ten men — ${homeTeam} will sense the opening immediately.`,
+        `Straight red for ${awayTeam}! A mountain to climb from here, and the market already knows it.`,
+      ]);
+      const text = `🟥 *RED CARD* — ${awayTeam}\n${homeTeam} ${curr.score} ${awayTeam}\n${commentary}`;
+      await notifyLinkedUsers(text, `Red card for ${awayTeam}. They're down to ten men.`);
+      await logMatchEvent(fixtureId, { type: "red", label: `Red card — ${awayTeam}` });
+    }
+    if (curr.yellowHome > prev.yellowHome) {
+      await notifyLinkedUsers(`🟨 Yellow card — ${homeTeam}\n${homeTeam} ${curr.score} ${awayTeam}\nBooked, and the referee's watching this one closely now.`);
+      await logMatchEvent(fixtureId, { type: "yellow", label: `Yellow card — ${homeTeam}` });
+    }
+    if (curr.yellowAway > prev.yellowAway) {
+      await notifyLinkedUsers(`🟨 Yellow card — ${awayTeam}\n${homeTeam} ${curr.score} ${awayTeam}\nBooked, and the referee's watching this one closely now.`);
+      await logMatchEvent(fixtureId, { type: "yellow", label: `Yellow card — ${awayTeam}` });
+    }
+    // Corners: timeline only — too frequent to justify a Telegram push
+    if (curr.cornersHome > prev.cornersHome) {
+      await logMatchEvent(fixtureId, { type: "corner", label: `Corner — ${homeTeam}` });
+    }
+    if (curr.cornersAway > prev.cornersAway) {
+      await logMatchEvent(fixtureId, { type: "corner", label: `Corner — ${awayTeam}` });
+    }
+    // Only fire for genuinely BIG shifts now — small odds wobble is noise, not news.
+    if (prev.oddsHome != null && curr.oddsHome != null && prev.oddsAway != null && curr.oddsAway != null) {
+      const prevHomeProb = impliedProb(prev.oddsHome);
+      const currHomeProb = impliedProb(curr.oddsHome);
+      const homeShiftPts = Math.abs(currHomeProb - prevHomeProb);
+      if (homeShiftPts >= ODDS_SHIFT_PROB_THRESHOLD) {
+        const favoring = currHomeProb > prevHomeProb ? homeTeam : awayTeam;
+        const commentary = pick([
+          `The market has swung hard toward ${favoring} — implied confidence moved from roughly ${prevHomeProb}% to ${currHomeProb}%.`,
+          `Money is piling in behind ${favoring} right now — confidence jumped from about ${prevHomeProb}% to ${currHomeProb}%.`,
+        ]);
+        const text = `📊 *Big odds shift* — ${homeTeam} vs ${awayTeam}\nHome ${prev.oddsHome.toFixed(2)} → ${curr.oddsHome.toFixed(2)} | Away ${prev.oddsAway.toFixed(2)} → ${curr.oddsAway.toFixed(2)}\n${commentary}`;
+        await notifyLinkedUsers(text, `Big odds shift. The market is now favoring ${favoring}.`);
+      }
+    }
+    if (prev.status !== "completed" && status === "completed") {
+      const [hGoals, aGoals] = curr.score.split("-").map(Number);
+      const resultLine = hGoals === aGoals
+        ? `It ends level — honours shared at ${curr.score}.`
+        : `${hGoals > aGoals ? homeTeam : awayTeam} see it out, ${curr.score} the final score.`;
+      const text = `🏁 *Full-time*\n${homeTeam} ${curr.score} ${awayTeam}\n${resultLine}`;
+      await notifyLinkedUsers(text, `Full time. ${homeTeam} ${curr.score.replace("-", " ")} ${awayTeam}.`);
+    }
+  }
+  prevFixtureState.set(fixtureId, { ...curr, status });
+}
+
+// ─── TXLINE AUTH STATE (refreshed automatically on 401) ────────────────
+let jwt = process.env.TXLINE_GUEST_JWT;
+let apiToken = process.env.TXLINE_API_TOKEN;
+
+if (!jwt || !apiToken) {
+  throw new Error(
+    "Missing TXLINE_GUEST_JWT or TXLINE_API_TOKEN env vars. Run subscribeAndActivate.js first and paste the output into Railway."
+  );
+}
+
+async function refreshJwt() {
+  console.log("Refreshing TxLINE guest JWT...");
+  const res = await axios.post(`${apiOrigin}/auth/guest/start`);
+  jwt = res.data.token;
+  console.log("Guest JWT refreshed.");
+}
+
+async function txlineGet(path, params) {
+  try {
+    const res = await axios.get(`${apiBaseUrl}${path}`, {
+      params,
+      timeout: 30000,
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "X-Api-Token": apiToken,
+      },
+    });
+    return res.data;
+  } catch (err) {
+    if (err.response?.status === 401) {
+      await refreshJwt();
+      const res = await axios.get(`${apiBaseUrl}${path}`, {
+        params,
+        timeout: 30000,
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "X-Api-Token": apiToken,
+        },
+      });
+      return res.data;
+    }
+    throw err;
+  }
+}
+
+// ─── FLAG LOOKUP (emoji, since that's what index.html renders directly) ─
+// Add to this as unmapped teams show up in the logs.
+const FLAGS = {
+  "Argentina": "🇦🇷", "Brazil": "🇧🇷", "France": "🇫🇷", "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+  "Spain": "🇪🇸", "Germany": "🇩🇪", "Portugal": "🇵🇹", "Netherlands": "🇳🇱",
+  "Belgium": "🇧🇪", "Italy": "🇮🇹", "Croatia": "🇭🇷", "Morocco": "🇲🇦",
+  "Uruguay": "🇺🇾", "Colombia": "🇨🇴", "Mexico": "🇲🇽", "USA": "🇺🇸",
+  "United States": "🇺🇸", "Canada": "🇨🇦", "Japan": "🇯🇵", "South Korea": "🇰🇷",
+  "Korea Republic": "🇰🇷", "Senegal": "🇸🇳", "Nigeria": "🇳🇬", "Ghana": "🇬🇭",
+  "Australia": "🇦🇺", "Switzerland": "🇨🇭", "Denmark": "🇩🇰", "Poland": "🇵🇱",
+  "Serbia": "🇷🇸", "Ecuador": "🇪🇨", "Iran": "🇮🇷", "Saudi Arabia": "🇸🇦",
+  "Qatar": "🇶🇦", "Tunisia": "🇹🇳", "Cameroon": "🇨🇲", "Wales": "🏴󠁧󠁢󠁷󠁬󠁳󠁿",
+  "Costa Rica": "🇨🇷", "Peru": "🇵🇪", "Chile": "🇨🇱", "Paraguay": "🇵🇾",
+  "Sweden": "🇸🇪", "Norway": "🇳🇴", "Austria": "🇦🇹", "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+  "Ukraine": "🇺🇦", "Turkey": "🇹🇷", "Egypt": "🇪🇬", "Ivory Coast": "🇨🇮",
+  "Algeria": "🇩🇿", "South Africa": "🇿🇦", "New Zealand": "🇳🇿", "Jamaica": "🇯🇲",
+  "Panama": "🇵🇦", "Honduras": "🇭🇳", "Vietnam": "🇻🇳", "Myanmar": "🇲🇲",
+  "India": "🇮🇳", "Liechtenstein": "🇱🇮", "Gibraltar": "🇬🇮",
+};
+function getFlag(teamName) {
+  if (FLAGS[teamName]) return FLAGS[teamName];
+  console.warn(`No flag mapped for "${teamName}" — add it to FLAGS in server.js. Using 🏳️ for now.`);
+  return "🏳️";
+}
+
+// ─── STATUS MAPPING ──────────────────────────────────────────────────────
+// Fixture.GameState (fixtures/snapshot): 1 = scheduled, 6 = cancelled (per docs)
+function statusFromFixture(fixture) {
+  if (fixture.GameState === 6) return "cancelled";
+  const start = new Date(fixture.StartTime).getTime();
+  const now = Date.now();
+  if (start > now) return "upcoming";
   return "live";
 }
 
-async function syncMarkets() {
-  const fixtures = await txline.getFixtures();
-  const byId = new Map(fixtures.map((f) => [f.FixtureId, f]));
+// Soccer feed "ended" phase codes (F=5, FET=10, FPE=13) — used if a Phase
+// field is present on score entries. Field name unconfirmed until we see
+// a real response; this checks a few likely names defensively.
+const ENDED_PHASE_CODES = [5, 10, 13];
+function isFinishedFromScores(scoreEntries) {
+  if (!Array.isArray(scoreEntries) || !scoreEntries.length) return false;
+  const last = scoreEntries[scoreEntries.length - 1];
+  const phase = last.Phase ?? last.GamePhase ?? last.phase ?? null;
+  if (phase == null) return false;
+  return ENDED_PHASE_CODES.includes(phase);
+}
 
-  for (const fixtureId of WORLD_CUP_FIXTURE_IDS) {
-    const fixture = byId.get(fixtureId);
-    if (!fixture) continue;
+// scoreEntries is an array of match EVENTS (goal, corner, shot, possession, etc.),
+// each carrying a cumulative "Stats" snapshot keyed by stat number as a string.
+// We want the Stats object from whichever event happened most recently.
+function getLatestStats(scoreEntries) {
+  if (!Array.isArray(scoreEntries) || !scoreEntries.length) return null;
+  let latest = null;
+  for (const entry of scoreEntries) {
+    if (!entry.Stats || !Object.keys(entry.Stats).length) continue; // skip metadata events with empty Stats
+    if (!latest || (entry.Ts ?? 0) > (latest.Ts ?? 0)) latest = entry;
+  }
+  return latest ? latest.Stats : null;
+}
+
+// Builds { playerNormativeId -> "Firstname Lastname" } from the "lineups" event,
+// which lists every player once before kickoff. Safe no-op if that event isn't present.
+function buildPlayerLookup(scoreEntries) {
+  const lookup = {};
+  if (!Array.isArray(scoreEntries)) return lookup;
+  for (const entry of scoreEntries) {
+    if (entry.Action !== "lineups" || !Array.isArray(entry.Lineups)) continue;
+    for (const team of entry.Lineups) {
+      if (!Array.isArray(team.lineups)) continue;
+      for (const slot of team.lineups) {
+        const p = slot.player;
+        if (p?.normativeId && p?.preferredName) {
+          const parts = p.preferredName.split(",").map(s => s.trim());
+          lookup[p.normativeId] = parts.length === 2 ? `${parts[1]} ${parts[0]}` : p.preferredName;
+        }
+      }
+    }
+  }
+  return lookup;
+}
+
+function getLatestEventByAction(scoreEntries, action) {
+  if (!Array.isArray(scoreEntries)) return null;
+  let latest = null;
+  for (const entry of scoreEntries) {
+    if (entry.Action !== action) continue;
+    if (!latest || (entry.Ts ?? 0) > (latest.Ts ?? 0)) latest = entry;
+  }
+  return latest;
+}
+
+function goalTypePhrase(goalType) {
+  const map = { Head: "with a header", Penalty: "from the spot", "Free Kick": "with a stunning free kick", "Own Goal": "into his own net" };
+  return (goalType && map[goalType]) || "";
+}
+
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// Extract "H-A" score string from stat keys (1 = P1 goals, 2 = P2 goals)
+function extractScore(scoreEntries, participant1IsHome) {
+  const stats = getLatestStats(scoreEntries);
+  if (!stats) return "0-0";
+  const p1Goals = Number(stats["1"]) || 0;
+  const p2Goals = Number(stats["2"]) || 0;
+  const homeGoals = participant1IsHome ? p1Goals : p2Goals;
+  const awayGoals = participant1IsHome ? p2Goals : p1Goals;
+  return `${homeGoals}-${awayGoals}`;
+}
+
+// Extract total card/corner counts from stat keys (3/4 = yellow, 5/6 = red, 7/8 = corners — home/away pairs)
+function extractCards(scoreEntries, participant1IsHome) {
+  const stats = getLatestStats(scoreEntries);
+  if (!stats) {
+    return { yellowHome: 0, yellowAway: 0, redHome: 0, redAway: 0, cornersHome: 0, cornersAway: 0 };
+  }
+  const p1Yellow = Number(stats["3"]) || 0;
+  const p2Yellow = Number(stats["4"]) || 0;
+  const p1Red = Number(stats["5"]) || 0;
+  const p2Red = Number(stats["6"]) || 0;
+  const p1Corners = Number(stats["7"]) || 0;
+  const p2Corners = Number(stats["8"]) || 0;
+  return {
+    yellowHome: participant1IsHome ? p1Yellow : p2Yellow,
+    yellowAway: participant1IsHome ? p2Yellow : p1Yellow,
+    redHome: participant1IsHome ? p1Red : p2Red,
+    redAway: participant1IsHome ? p2Red : p1Red,
+    cornersHome: participant1IsHome ? p1Corners : p2Corners,
+    cornersAway: participant1IsHome ? p2Corners : p1Corners,
+  };
+}
+
+// ─── ODDS EXTRACTION (confirmed field names from real TxLINE response) ──
+let hasLoggedRawPrices = false;
+function extract1x2Odds(oddsEntries, participant1IsHome) {
+  if (!Array.isArray(oddsEntries) || !oddsEntries.length) return null;
+
+  for (const entry of oddsEntries) {
+    if (entry.SuperOddsType !== "1X2_PARTICIPANT_RESULT") continue;
+
+    const names = entry.PriceNames;
+    const prices = entry.Prices;
+    if (!Array.isArray(names) || !Array.isArray(prices) || names.length !== prices.length) continue;
+
+    if (!hasLoggedRawPrices) {
+      console.log(`Raw 1X2 prices (scale check): names=${JSON.stringify(names)} prices=${JSON.stringify(prices)}`);
+      hasLoggedRawPrices = true;
+    }
+
+    let part1 = null, draw = null, part2 = null;
+    for (let i = 0; i < names.length; i++) {
+      const label = String(names[i]).toLowerCase();
+      const price = Number(prices[i]);
+      if (label === "part1") part1 = price;
+      else if (label === "draw") draw = price;
+      else if (label === "part2") part2 = price;
+    }
+    if (part1 && draw && part2) {
+      const home = participant1IsHome ? part1 : part2;
+      const away = participant1IsHome ? part2 : part1;
+      return {
+        oddsHome: home / 1000,
+        oddsDraw: draw / 1000,
+        oddsAway: away / 1000,
+      };
+    }
+  }
+  return null;
+}
+
+// ─── BET SETTLEMENT ──────────────────────────────────────────────────────
+async function settleBets(fixtureId, winner) {
+  if (!winner) return;
+  const marketId = `wc_${fixtureId}`;
+  const betsSnap = await db.collection("bets")
+    .where("marketId", "==", marketId)
+    .where("status", "==", "pending")
+    .get();
+  if (betsSnap.empty) return;
+
+  const batch = db.batch();
+  let settledCount = 0;
+  for (const betDoc of betsSnap.docs) {
+    const bet = betDoc.data();
+    if (!bet.outcome) continue; // pre-fix bets with no outcome field — leave pending, don't guess
+    const won = bet.outcome === winner;
+    batch.update(betDoc.ref, { status: won ? "won" : "lost" });
+    if (won) {
+      batch.update(db.collection("users").doc(bet.uid), {
+        balance: admin.firestore.FieldValue.increment(bet.payout),
+      });
+    }
+    settledCount++;
+  }
+  await batch.commit();
+  console.log(`Settled ${settledCount} bet(s) for ${marketId} (winner: ${winner}).`);
+}
+
+// ─── MAIN SYNC ────────────────────────────────────────────────────────────
+async function syncMarkets() {
+  console.log(`[${new Date().toISOString()}] Sync starting...`);
+
+  const fixtures = await txlineGet("/fixtures/snapshot");
+  console.log(`Fetched ${fixtures.length} fixtures.`);
+
+  const liveCount = fixtures.filter(f => f.GameState !== 6 && statusFromFixture(f) === "live").length;
+  const upcomingCount = fixtures.filter(f => f.GameState !== 6 && statusFromFixture(f) === "upcoming").length;
+  db.collection("stats").doc("global").set({
+    totalMatches: fixtures.length,
+    liveNow: liveCount,
+    upcoming: upcomingCount,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true }).catch(err => console.warn("Failed to write public stats:", err.message));
+
+  for (const fixture of fixtures) {
     try {
+      const fixtureId = fixture.FixtureId;
       const homeTeam = fixture.Participant1IsHome ? fixture.Participant1 : fixture.Participant2;
       const awayTeam = fixture.Participant1IsHome ? fixture.Participant2 : fixture.Participant1;
 
-      let status = "scheduled";
-      let score = "0-0";
-      let winner = null;
-      try {
-        const scores = await txline.getScores(fixtureId);
-        const finalRecord = scores.find((s) => s.action === "game_finalised");
-        const latest = scores[scores.length - 1];
-        if (finalRecord) {
-          status = "completed";
-        } else if (latest && latest.phaseId) {
-          status = mapPhaseToStatus(latest.phaseId);
-        }
-        // Stat keys 1 and 2 are total goals for participant 1 / 2 (see soccer feed docs)
-        const goalsRecord = [...scores].reverse().find((s) => s.Stats && (s.Stats["1"] !== undefined || s.Stats["2"] !== undefined));
-        if (goalsRecord) {
-          const p1Goals = goalsRecord.Stats["1"] || 0;
-          const p2Goals = goalsRecord.Stats["2"] || 0;
-          const homeGoals = fixture.Participant1IsHome ? p1Goals : p2Goals;
-          const awayGoals = fixture.Participant1IsHome ? p2Goals : p1Goals;
-          score = `${homeGoals}-${awayGoals}`;
-          if (status === "completed") {
-            winner = homeGoals > awayGoals ? "home" : awayGoals > homeGoals ? "away" : "draw";
-          }
-        }
-      } catch (e) {
-        // No scores yet for a scheduled fixture is expected — keep defaults
+      if (fixture.GameState === 6) {
+        // cancelled — remove if it exists, skip otherwise
+        await db.collection("markets").doc(`wc_${fixtureId}`).delete().catch(() => {});
+        continue;
       }
 
-      let odds = null;
-      try {
-        const oddsData = await txline.getOdds(fixtureId);
-        const latestOdds = oddsData[oddsData.length - 1];
-        if (latestOdds) {
-          odds = {
-            oddsHome: fixture.Participant1IsHome ? latestOdds.price1 : latestOdds.price2,
-            oddsDraw: latestOdds.priceX,
-            oddsAway: fixture.Participant1IsHome ? latestOdds.price2 : latestOdds.price1,
-          };
-        }
-      } catch (e) {
-        // odds not published yet
+      const [oddsData, scoreData] = await Promise.all([
+        txlineGet(`/odds/snapshot/${fixtureId}`).catch((err) => {
+          console.warn(`Odds fetch failed for fixture ${fixtureId}:`, err.message);
+          return null;
+        }),
+        txlineGet(`/scores/snapshot/${fixtureId}`).catch((err) => {
+          console.warn(`Scores fetch failed for fixture ${fixtureId}:`, err.message);
+          return null;
+        }),
+      ]);
+
+      const finished = isFinishedFromScores(scoreData);
+      let status = finished ? "completed" : statusFromFixture(fixture);
+      // Safety net: don't let a match stay "live" forever if TxLINE's finish
+      // signal never fires for this fixture. 130 min covers 90 + stoppage + HT.
+      if (status === "live") {
+        const elapsedMins = (Date.now() - new Date(fixture.StartTime).getTime()) / 60000;
+        if (elapsedMins > 130) status = "completed";
+      }
+      const score = extractScore(scoreData, fixture.Participant1IsHome);
+      const cards = extractCards(scoreData, fixture.Participant1IsHome);
+      const odds = extract1x2Odds(oddsData, fixture.Participant1IsHome);
+
+      if (!odds && status !== "completed") {
+        console.warn(`Fixture ${fixtureId} (${homeTeam} vs ${awayTeam}) — no odds yet, writing without them.`);
+      }
+
+      let winner = null;
+      if (status === "completed") {
+        const [h, a] = score.split("-").map(Number);
+        winner = h > a ? "home" : a > h ? "away" : "draw";
       }
 
       const marketDoc = {
         home: homeTeam,
         away: awayTeam,
+        homeFlag: getFlag(homeTeam),
+        awayFlag: getFlag(awayTeam),
         status,
         score,
         winner,
-        kickoffAt: fixture.StartTime,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        time: new Date(fixture.StartTime).toLocaleString("en-GB", {
+          day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+        }),
+        kickoffAt: fixture.StartTime, // raw ISO timestamp — used client-side to estimate elapsed match minute
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
-      if (odds) Object.assign(marketDoc, odds);
+      if (odds) {
+        marketDoc.oddsHome = odds.oddsHome;
+        marketDoc.oddsDraw = odds.oddsDraw;
+        marketDoc.oddsAway = odds.oddsAway;
+      }
 
       await db.collection("markets").doc(`wc_${fixtureId}`).set(marketDoc, { merge: true });
 
-      if (status === "completed" && winner) {
-        await settleBets(fixtureId, winner);
+      await maybeNotify(fixtureId, homeTeam, awayTeam, marketDoc, odds, cards, status, scoreData);
+
+      if (status === "completed") {
+        await settleBets(fixtureId, marketDoc.winner);
       }
     } catch (err) {
-      console.error(`Failed syncing fixture ${fixtureId}:`, err.message);
+      console.error(`Failed syncing fixture ${fixture.FixtureId}:`, err.message);
+      // never let one bad fixture kill the whole cycle
     }
   }
+
   console.log(`[${new Date().toISOString()}] Sync complete.`);
 }
 
-async function settleBets(fixtureId, winner) {
-  const pendingSnap = await db
-    .collection("bets")
-    .where("fixtureId", "==", fixtureId)
-    .where("status", "==", "pending")
-    .get();
-  if (pendingSnap.empty) return;
+// ─── LIVE DUAL COMMENTARY (Groq-generated, shared via Firestore) ────────
+const COMMENTATOR_A = "Marcus"; // male voice on frontend
+const COMMENTATOR_B = "Elena";  // female voice on frontend
+const commentarySequences = {}; // matchId -> last sequence number written
 
-  const batch = db.batch();
-  for (const doc of pendingSnap.docs) {
-    const bet = doc.data();
-    const won = bet.pick === winner;
-    batch.update(doc.ref, { status: won ? "won" : "lost" });
-    if (won) {
-      const userRef = db.collection("users").doc(bet.pubkey);
-      batch.update(userRef, { points: admin.firestore.FieldValue.increment(bet.potentialPayout) });
-    }
-  }
-  await batch.commit();
-  console.log(`Settled ${pendingSnap.size} bets for fixture ${fixtureId}`);
-}
+async function generateCommentaryBatch(match) {
+  if (!process.env.GROQ_API_KEY) return [];
 
-function syncLoop() {
-  syncMarkets()
-    .catch((err) => console.error("Sync cycle failed:", err.message))
-    .finally(() => setTimeout(syncLoop, SYNC_INTERVAL_MS));
-}
+  const prompt = `You are writing a short live football commentary exchange between two commentators, ${COMMENTATOR_A} (male) and ${COMMENTATOR_B} (female), for a World Cup match: ${match.home} vs ${match.away}. Current score: ${match.score || "0-0"}. Match status: ${match.status}.
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+Rules:
+- Only discuss team-level play, tactics, atmosphere, and the scoreline. Do NOT invent specific player names, goals, cards, or moments — we do not have that data and it would be inaccurate.
+- Write 4 to 6 short alternating lines of natural dialogue between the two commentators, as if mid-broadcast (no greetings, no "welcome back", just ongoing commentary).
+- They can ask each other questions and react to each other.
+- Keep each line under 25 words.
+- Return ONLY a JSON array like: [{"speaker":"Marcus","text":"..."},{"speaker":"Elena","text":"..."}]`;
 
-app.listen(process.env.PORT || 3000, async () => {
-  console.log(`MATCHDAY listening on port ${process.env.PORT || 3000}`);
   try {
-    await txline.subscribeAndActivate();
-    syncLoop();
+    const res = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: "llama-3.3-70b-versatile",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.9,
+        max_tokens: 500,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 20000,
+      }
+    );
+    const raw = res.data.choices[0].message.content.trim();
+    const jsonMatch = raw.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return [];
+    const lines = JSON.parse(jsonMatch[0]);
+    return Array.isArray(lines) ? lines : [];
   } catch (err) {
-    console.error("TxLINE activation failed — server is up but matches won't sync:", err.message);
+    console.error("Groq commentary generation failed:", err.response?.data || err.message);
+    return [];
+  }
+}
+
+async function commentaryLoop() {
+  try {
+    const liveSnap = await db.collection("markets").where("status", "==", "live").get();
+    for (const doc of liveSnap.docs) {
+      const match = { id: doc.id, ...doc.data() };
+      const lines = await generateCommentaryBatch(match);
+      if (!lines.length) continue;
+
+      let seq = commentarySequences[match.id] || 0;
+      const batch = db.batch();
+      lines.forEach(line => {
+        seq += 1;
+        const ref = db.collection("commentaryLines").doc(`${match.id}_${seq}`);
+        batch.set(ref, {
+          matchId: match.id,
+          sequence: seq,
+          speaker: line.speaker === COMMENTATOR_B ? COMMENTATOR_B : COMMENTATOR_A,
+          text: line.text,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      commentarySequences[match.id] = seq;
+      console.log(`Commentary: wrote ${lines.length} lines for ${match.home} vs ${match.away} (seq up to ${seq})`);
+    }
+  } catch (err) {
+    console.error("Commentary cycle failed:", err.response?.data || err.message);
+  } finally {
+    setTimeout(commentaryLoop, COMMENTARY_INTERVAL_MS);
+  }
+}
+
+// ─── LOOP (never crash the process on a bad cycle) ──────────────────────
+async function syncLoop() {
+  try {
+    await syncMarkets();
+  } catch (err) {
+    console.error("Sync cycle failed:", err.response?.data || err.message);
+  } finally {
+    setTimeout(syncLoop, SYNC_INTERVAL_MS);
+  }
+}
+
+// ─── HEALTHCHECK SERVER (Railway needs a listening port) ────────────────
+const app = express();
+app.use(express.static(__dirname));
+app.use(express.json({ limit: "8mb" })); // profile photos as base64 can be a few MB
+app.get("/", (req, res) => res.sendFile(__dirname + "/index.html"));
+app.get("/health", (req, res) => res.json({ status: "ok", network: NETWORK }));
+
+// ─── AVATAR UPLOAD (proxies to imgbb so the API key never reaches the browser) ─
+app.post("/api/upload-avatar", async (req, res) => {
+  try {
+    const { imageBase64 } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "No image provided" });
+    if (!process.env.IMGBB_API_KEY) return res.status(500).json({ error: "Uploads not configured" });
+
+    const cleaned = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
+    const params = new URLSearchParams();
+    params.append("key", process.env.IMGBB_API_KEY);
+    params.append("image", cleaned);
+
+    const response = await axios.post("https://api.imgbb.com/1/upload", params, { timeout: 15000 });
+    const url = response.data?.data?.url;
+    if (!url) return res.status(502).json({ error: "Upload failed" });
+    res.json({ url });
+  } catch (err) {
+    console.error("Avatar upload failed:", err.message);
+    res.status(500).json({ error: "Upload failed" });
   }
 });
+
+// SPA fallback: any other route (e.g. /home, /matches, /bets, /profile) still
+// serves index.html so a page refresh doesn't 404 — the client-side router
+// in index.html reads the URL and switches to the right tab.
+app.get(/^\/(?!health).*/, (req, res) => res.sendFile(__dirname + "/index.html"));
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Server listening on port ${process.env.PORT || 3000}`);
+  syncLoop();
+  commentaryLoop();
+});
+
+// ─── GRACEFUL SHUTDOWN (stops Telegram polling before the old container dies) ──
+function shutdown(signal) {
+  console.log(`${signal} received — stopping Telegram polling before exit...`);
+  if (bot) {
+    bot.stopPolling().finally(() => process.exit(0));
+  } else {
+    process.exit(0);
+  }
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
